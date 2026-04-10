@@ -2,17 +2,17 @@
  * JEBML - Java library to read/write EBML/Matroska elements.
  * Copyright (C) 2004 Jory Stone <jebml@jory.info>
  * Based on Javatroska (C) 2002 John Cannon <spyder@matroska.org>
- * 
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
- * 
+ *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
@@ -44,6 +44,8 @@ import org.slf4j.LoggerFactory;
  * </p>
  * <p>Note that if the TrackType is Audio, you must add the AudioTrack member. Likewise VideoTrack for Video.</p>
  */
+@lombok.Getter
+@lombok.Setter
 public class MatroskaFileTrack
 {
   private static final Logger LOG = LoggerFactory.getLogger(MatroskaFileTrack.class);
@@ -108,102 +110,29 @@ public class MatroskaFileTrack
 
   private TrackType trackType;
 
+  @lombok.Getter
+  @lombok.Setter
   public static class MatroskaVideoTrack
   {
     private short pixelWidth;
     private short pixelHeight;
     private short displayWidth = 0;
     private short displayHeight = 0;
-
-    public short getPixelWidth()
-    {
-      return pixelWidth;
-    }
-
-    public void setPixelWidth(final short pixelWidth)
-    {
-      this.pixelWidth = pixelWidth;
-    }
-
-    public short getPixelHeight()
-    {
-      return pixelHeight;
-    }
-
-    public void setPixelHeight(final short pixelHeight)
-    {
-      this.pixelHeight = pixelHeight;
-    }
-
-    public short getDisplayWidth()
-    {
-      return displayWidth;
-    }
-
-    public void setDisplayWidth(final short displayWidth)
-    {
-      this.displayWidth = displayWidth;
-    }
-
-    public short getDisplayHeight()
-    {
-      return displayHeight;
-    }
-
-    public void setDisplayHeight(final short displayHeight)
-    {
-      this.displayHeight = displayHeight;
-    }
+    private ByteBuffer colourSpace = null;
   }
 
   private MatroskaVideoTrack video = null;
 
+  @lombok.Getter
+  @lombok.Setter  
   public static class MatroskaAudioTrack
   {
     private float samplingFrequency;
     private float outputSamplingFrequency;
     private short channels;
     private byte bitDepth;
-
-    public float getSamplingFrequency()
-    {
-      return samplingFrequency;
-    }
-
-    public void setSamplingFrequency(final float samplingFrequency)
-    {
-      this.samplingFrequency = samplingFrequency;
-    }
-
-    public float getOutputSamplingFrequency()
-    {
-      return outputSamplingFrequency;
-    }
-
-    public void setOutputSamplingFrequency(final float outputSamplingFrequency)
-    {
-      this.outputSamplingFrequency = outputSamplingFrequency;
-    }
-
-    public short getChannels()
-    {
-      return channels;
-    }
-
-    public void setChannels(final short channels)
-    {
-      this.channels = channels;
-    }
-
-    public byte getBitDepth()
-    {
-      return bitDepth;
-    }
-
-    public void setBitDepth(final int bitDepth)
-    {
-      this.bitDepth = (byte) bitDepth;
-    }
+    /** Bitrate in kbps, populated for CBR codecs such as AC-3. Null if not determined. */
+    private Integer bitrateKbps = null;
   }
 
   private MatroskaAudioTrack audio = null;
@@ -225,7 +154,7 @@ public class MatroskaFileTrack
 
   /**
    * Converts the Track to String form
-   * 
+   *
    * @return String form of MatroskaFileTrack data
    */
   @Override
@@ -268,6 +197,43 @@ public class MatroskaFileTrack
     }
 
     return s;
+  }
+
+  /**
+   * Parses the bitrate (kbps) from the first bytes of an AC-3 sync frame.
+   * AC-3 stores this in the {@code frmsizecod} field at byte offset 4 of each sync frame
+   * (after the 2-byte sync word 0x0B77 and the 2-byte CRC1).
+   *
+   * @param frameData the raw frame data (at least 5 bytes, starting at the AC-3 sync word)
+   * @return the bitrate in kbps, or {@code null} if the data is too short or the sync word is absent
+   */
+  public static Integer parseAc3BitrateKbps(final ByteBuffer frameData)
+  {
+    if (frameData == null || frameData.remaining() < 5)
+    {
+      return null;
+    }
+    final ByteBuffer slice = frameData.duplicate();
+    // Sync word must be 0x0B77
+    final int b0 = slice.get() & 0xFF;
+    final int b1 = slice.get() & 0xFF;
+    if (b0 != 0x0B || b1 != 0x77)
+    {
+      return null;
+    }
+    // Skip CRC1 (2 bytes)
+    slice.get();
+    slice.get();
+    // Byte 4: fscod (bits 7-6) | frmsizecod (bits 5-0)
+    final int frmsizecod = slice.get() & 0x3F;
+    final int bitrateIndex = frmsizecod >> 1;
+    // AC-3 standard bitrate table (ATSC A/52, Table 4.13)
+    final int[] AC3_BITRATES_KBPS = { 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640 };
+    if (bitrateIndex >= AC3_BITRATES_KBPS.length)
+    {
+      return null;
+    }
+    return AC3_BITRATES_KBPS[bitrateIndex];
   }
 
   static MatroskaFileTrack fromElement(final Element level2, final DataSource ioDS, final EBMLReader reader)
@@ -353,6 +319,11 @@ public class MatroskaFileTrack
           {
             level4.readData(ioDS);
             track.video.setDisplayHeight((short) ((UnsignedIntegerElement) level4).getValue());
+          }
+          else if (level4.isType(MatroskaDocTypes.ColourSpace.getType()))
+          {
+            level4.readData(ioDS);
+            track.video.setColourSpace(((BinaryElement) level4).getData());
           }
 
           level4.skipData(ioDS);
@@ -463,7 +434,6 @@ public class MatroskaFileTrack
       final BinaryElement trackCodecPrivateElem = MatroskaDocTypes.CodecPrivate.getInstance();
       trackCodecPrivateElem.setData(this.getCodecPrivate());
       trackEntryElem.addChildElement(trackCodecPrivateElem);
-
     }
 
     final UnsignedIntegerElement trackDefaultDurationElem = MatroskaDocTypes.DefaultDuration.getInstance();
@@ -481,7 +451,7 @@ public class MatroskaFileTrack
 
     if (!overlayUids.isEmpty())
     {
-      for (final Long overlay: overlayUids)
+      for (final Long overlay : overlayUids)
       {
         final UnsignedIntegerElement trackOverlayElem = MatroskaDocTypes.TrackOverlay.getInstance();
         trackOverlayElem.setValue(overlay);
@@ -506,10 +476,21 @@ public class MatroskaFileTrack
       final UnsignedIntegerElement trackVideoDisplayHeightElem = MatroskaDocTypes.DisplayHeight.getInstance();
       trackVideoDisplayHeightElem.setValue(this.video.getDisplayHeight());
 
+      BinaryElement colourSpaceElem = null;
+      if (this.video.getColourSpace() != null)
+      {
+        colourSpaceElem = MatroskaDocTypes.ColourSpace.getInstance();
+        colourSpaceElem.setData(this.video.getColourSpace());
+      }
+
       trackVideoElem.addChildElement(trackVideoPixelWidthElem);
       trackVideoElem.addChildElement(trackVideoPixelHeightElem);
       trackVideoElem.addChildElement(trackVideoDisplayWidthElem);
       trackVideoElem.addChildElement(trackVideoDisplayHeightElem);
+      if (colourSpaceElem != null)
+      {
+        trackVideoElem.addChildElement(colourSpaceElem);
+      }
 
       trackEntryElem.addChildElement(trackVideoElem);
     }
@@ -540,7 +521,7 @@ public class MatroskaFileTrack
     {
       final MasterElement trackOpElem = MatroskaDocTypes.TrackOperation.getInstance();
       final MasterElement trackJoinElem = MatroskaDocTypes.TrackJoinBlocks.getInstance();
-      for (final Long uid: operation.joinUIDs)
+      for (final Long uid : operation.joinUIDs)
       {
         final UnsignedIntegerElement joinUidElem = MatroskaDocTypes.TrackJoinUID.getInstance();
         joinUidElem.setValue(uid);

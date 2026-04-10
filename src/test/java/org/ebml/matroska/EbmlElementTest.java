@@ -1,6 +1,6 @@
 package org.ebml.matroska;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.nio.ByteBuffer;
 import java.util.Random;
@@ -8,19 +8,19 @@ import java.util.Random;
 import org.ebml.EBMLReader;
 import org.ebml.Element;
 import org.ebml.MockSource;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 public class EbmlElementTest
 {
 
-  @Before
+  @BeforeEach
   public void setUp() throws Exception
   {
   }
 
-  @After
+  @AfterEach
   public void tearDown() throws Exception
   {
   }

@@ -19,22 +19,18 @@ public class MatroskaSegmentInfo
   private long timecodeScale = 1000000;
   private Double duration;
   private Date segmentDate = new Date();
-  private final long myPosition;
-
-  public MatroskaSegmentInfo(final long position)
-  {
-    myPosition = position;
-  }
+  private long myPosition;
 
   public long writeElement(final DataWriter ioDW)
   {
+    myPosition = ioDW.getFilePointer();
     final MasterElement segmentInfoElem = MatroskaDocTypes.Info.getInstance();
 
     final StringElement writingAppElem = MatroskaDocTypes.WritingApp.getInstance();
     writingAppElem.setValue("Matroska File Writer v1.0");
 
     final StringElement muxingAppElem = MatroskaDocTypes.MuxingApp.getInstance();
-    muxingAppElem.setValue("JEBML v1.0");
+    muxingAppElem.setValue("JEBML v2.2");
 
     final DateElement dateElem = MatroskaDocTypes.DateUTC.getInstance();
     dateElem.setDate(segmentDate);

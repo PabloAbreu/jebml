@@ -9,19 +9,19 @@
 package org.ebml.matroska;
 
 import org.ebml.MockWriter;
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 public class VoidElementTest
 {
-  @Before
+  @BeforeEach
   public void setUp() throws Exception
   {
   }
 
-  @After
+  @AfterEach
   public void tearDown() throws Exception
   {
   }
@@ -37,7 +37,7 @@ public class VoidElementTest
       VoidElement voidz = new VoidElement(i);
       MockWriter mw = new MockWriter();
       voidz.writeElement(mw);
-      Assert.assertEquals(i, mw.getBuff().position());
+      Assertions.assertEquals(i, mw.getBuff().position());
     }
   }
 
@@ -52,7 +52,7 @@ public class VoidElementTest
       VoidElement voidz = new VoidElement(i);
       MockWriter mw = new MockWriter();
       voidz.writeElement(mw);
-      Assert.assertEquals(i, mw.getBuff().position());
+      Assertions.assertEquals(i, mw.getBuff().position());
     }
   }
 }

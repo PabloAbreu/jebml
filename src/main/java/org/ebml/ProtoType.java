@@ -10,11 +10,12 @@ public class ProtoType<T extends Element>
 {
   private static final Logger LOG = LoggerFactory.getLogger(ProtoType.class);
   private static final HashMap<Long, ProtoType<? extends Element>> CLASS_MAP = new HashMap<>();
-  Class<T> clazz;
+  private final Class<T> clazz;
   private final ByteBuffer type;
 
   private final String name;
   private final int level;
+  private long typeCode;
 
   public ProtoType(final Class<T> clazz, final String name, final byte[] type, final int level)
   {
@@ -22,9 +23,9 @@ public class ProtoType<T extends Element>
     this.type = ByteBuffer.wrap(type);
     this.name = name;
     this.level = level;
-    final long codename = EBMLReader.parseEBMLCode(this.type);
-    CLASS_MAP.put(codename, this);
-    LOG.trace("Associating {} with {}", name, codename);
+    typeCode = EBMLReader.parseEBMLCode(this.type);
+    CLASS_MAP.put(typeCode, this);
+    LOG.trace("Associating {} with {}", name, typeCode);
   }
 
   public T getInstance()
@@ -32,12 +33,12 @@ public class ProtoType<T extends Element>
     LOG.trace("Instantiating {}", name);
     try
     {
-      final T elem = clazz.newInstance();
+      final T elem = clazz.getConstructor().newInstance();
       elem.setType(type);
       elem.setElementType(this);
       return elem;
     }
-    catch (InstantiationException | IllegalAccessException e)
+    catch (Exception e)
     {
       LOG.error("Failed to instantiate: this should never happen!", e);
       throw new RuntimeException(e);
@@ -47,12 +48,13 @@ public class ProtoType<T extends Element>
   public static Element getInstance(final ByteBuffer type)
   {
     final long codename = EBMLReader.parseEBMLCode(type);
-    final ProtoType<? extends Element> eType = CLASS_MAP.get(Long.valueOf(codename));
-
-    if (eType == null) {
+    Long codeValue = Long.valueOf(codename);
+    final ProtoType<? extends Element> eType = CLASS_MAP.get(codeValue);
+    if (eType == null)
+    {
+      LOG.warn("Unrecognized element type {}", Long.toHexString(codeValue));
       return null;
     }
-
     LOG.trace("Got codename {}, for element type {}", codename, eType.name);
     return eType.getInstance();
   }
@@ -69,7 +71,11 @@ public class ProtoType<T extends Element>
 
   public ByteBuffer getType()
   {
-    return type;
+    return type.asReadOnlyBuffer();
   }
 
+  public long getTypeCode()
+  {
+    return typeCode;
+  }
 }

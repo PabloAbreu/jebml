@@ -2,29 +2,36 @@
  * JEBML - Java library to read/write EBML/Matroska elements.
  * Copyright (C) 2004 Jory Stone <jebml@jory.info>
  * Based on Javatroska (C) 2002 John Cannon <spyder@matroska.org>
- * 
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
- * 
+ *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 package org.ebml.matroska;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
+import org.ebml.BinaryElement;
 import org.ebml.DateElement;
 import org.ebml.EBMLReader;
 import org.ebml.Element;
@@ -54,16 +61,22 @@ public class MatroskaFile
   private final DataSource ioDS;
   private final EBMLReader reader;
   private Element level0 = null;
+  // Level1 is required for lazy reading of frames
+  private Element level1 = null;
   private String segmentTitle;
   private Date segmentDate;
   private String muxingApp;
   private String writingApp;
   private long timecodeScale = 1000000;
   private double duration;
-  private final ArrayList<MatroskaFileTrack> trackList = new ArrayList<>();
-  private final ArrayList<MatroskaFileTagEntry> tagList = new ArrayList<>();
-  private final Queue<MatroskaFileFrame> frameQueue = new ConcurrentLinkedQueue<>();
+  private final List<MatroskaFileTrack> trackList = new ArrayList<>();
+  private final List<MatroskaFileTagEntry> tagList = new ArrayList<>();
+  private final List<FileCue> cueList = new ArrayList<>();
+  private final Deque<MatroskaFileFrame> frameQueue = new ConcurrentLinkedDeque<>();
   private boolean scanFirstCluster = true;
+  private long endOfSegmentHeader;
+  private Map<MatroskaDocType, Long> metaSeek = new HashMap<>();
+  private int clusterReadIndex = 0;
 
   /**
    * Primary Constructor for Matroska File class.
@@ -78,12 +91,11 @@ public class MatroskaFile
 
   /**
    * Read / Parse the Matroska file. Call this before any other method.
-   * 
+   *
    * @throws RuntimeException On various errors
    */
   public void readFile()
   {
-    Element level1 = null;
     final Element level2 = null;
     // Element level3 = null;
     // Element level4 = null;
@@ -121,6 +133,7 @@ public class MatroskaFile
     level0 = reader.readNextElement();
     if (level0.isType(MatroskaDocTypes.Segment.getType()))
     {
+      endOfSegmentHeader = ioDS.getFilePointer();
       level1 = ((MasterElement) level0).readNextChild(reader);
       LOG.debug("Got segment element");
       while (level1 != null)
@@ -129,27 +142,32 @@ public class MatroskaFile
         if (level1.isType(MatroskaDocTypes.Info.getType()))
         {
           parseSegmentInfo(level1, level2);
-
         }
         else if (level1.isType(MatroskaDocTypes.Tracks.getType()))
         {
           parseTracks(level1, level2);
-
         }
         else if (level1.isType(MatroskaDocTypes.Cluster.getType()))
         {
           if (scanFirstCluster)
           {
             parseNextCluster(level1);
+            populateAc3Bitrates();
           }
           // Break out of this loop, we should only parse the first cluster
           break;
-
         }
         else if (level1.isType(MatroskaDocTypes.Tags.getType()))
         {
           parseTags(level1, level2);
-
+        }
+        else if (level1.isType(MatroskaDocTypes.Cues.getType()) && isSeekable())
+        {
+          parseCues((MasterElement) level1);
+        }
+        else if (level1.isType(MatroskaDocTypes.SeekHead.getType()) && isSeekable())
+        {
+          parseMetaSeek(level1);
         }
 
         level1.skipData(ioDS);
@@ -163,12 +181,60 @@ public class MatroskaFile
     }
   }
 
+  private void parseMetaSeek(Element level1)
+  {
+    MasterElement seekHead = (MasterElement) level1;
+    for (Element seekElem : seekHead.remainingChildren(ioDS, reader))
+    {
+      if (seekElem.isType(MatroskaDocTypes.Seek.getType()))
+      {
+        MasterElement seekElement = (MasterElement) seekElem;
+        MatroskaDocType id = MatroskaDocType.UNKNOWN;
+        long position = endOfSegmentHeader;
+        for (Element seekMarker : seekElement.remainingChildren(ioDS, reader))
+        {
+          seekMarker.readData(ioDS);
+          if (seekMarker.isType(MatroskaDocTypes.SeekID.getType()))
+          {
+            BinaryElement binElem = (BinaryElement) seekMarker;
+            ByteBuffer type = binElem.getData();
+            id = MatroskaDocType.getType(type);
+          }
+          else if (seekMarker.isType(MatroskaDocTypes.SeekPosition.getType()))
+          {
+            position += ((UnsignedIntegerElement) seekMarker).getValue();
+          }
+        }
+        metaSeek.put(id, position);
+      }
+    }
+  }
+
+  /**
+   * Get the "previous" frame. Note that calls to {@link #getPreviousFrame()} and {@link #getNextFrame()} may not be interleaved.
+   * If you change direction, you must call {@link #seek(long)} in between.
+   */
+  public synchronized MatroskaFileFrame getPreviousFrame()
+  {
+    if (frameQueue.isEmpty() && clusterReadIndex >= 0)
+    {
+      // Seek to the previous cluster
+      int cueIdx = clusterReadIndex;
+      FileCue cue = cueList.get(cueIdx);
+      ioDS.seek(cue.position);
+      level1 = null;
+      fillFrameQueue();
+      clusterReadIndex = cueIdx - 1;
+    }
+    return frameQueue.pollLast();
+  }
+
   /**
    * Get the Next MatroskaFileFrame
    *
    * @return The next MatroskaFileFrame in the queue, or null if the file has ended
    */
-  public MatroskaFileFrame getNextFrame()
+  public synchronized MatroskaFileFrame getNextFrame()
   {
     if (frameQueue.isEmpty())
     {
@@ -176,11 +242,7 @@ public class MatroskaFile
     }
 
     // If FrameQueue is still empty, must be the end of the file
-    if (frameQueue.isEmpty())
-    {
-      return null;
-    }
-    return frameQueue.remove();
+    return frameQueue.poll();
   }
 
   /**
@@ -189,7 +251,7 @@ public class MatroskaFile
    * @param trackNo The track number to only get MatroskaFileFrame(s) from
    * @return The next MatroskaFileFrame in the queue, or null if there are no more frames for the TrackNo track
    */
-  public MatroskaFileFrame getNextFrame(final int trackNo)
+  public synchronized MatroskaFileFrame getNextFrame(final int trackNo)
   {
     if (frameQueue.isEmpty())
     {
@@ -213,10 +275,7 @@ public class MatroskaFile
           frame = iter.next();
           if (frame.getTrackNo() == trackNo)
           {
-            synchronized (frameQueue)
-            {
-              iter.remove();
-            }
+            iter.remove();
             return frame;
           }
           frame = null;
@@ -235,7 +294,7 @@ public class MatroskaFile
     }
     catch (final RuntimeException ex)
     {
-      ex.printStackTrace();
+      LOG.warn("Exception while looking for next frame for track {}", trackNo, ex);
       return null;
     }
 
@@ -245,6 +304,29 @@ public class MatroskaFile
   public boolean isSeekable()
   {
     return this.ioDS.isSeekable();
+  }
+
+  private boolean parseCuesIfNeeded()
+  {
+    if (cueList.isEmpty() && isSeekable() && metaSeek.containsKey(MatroskaDocType.Cues))
+    {
+      long origin = ioDS.getFilePointer();
+      try
+      {
+        long position = metaSeek.get(MatroskaDocType.Cues);
+        ioDS.seek(position);
+        Element cues = reader.readNextElement();
+        if (cues.isType(MatroskaDocTypes.Cues.getType()))
+        {
+          parseCues((MasterElement) cues);
+        }
+      }
+      finally
+      {
+        ioDS.seek(origin);
+      }
+    }
+    return !cueList.isEmpty();
   }
 
   /**
@@ -303,33 +385,142 @@ public class MatroskaFile
    * </p>
    *
    * @param timecode Timecode to seek to in millseconds
+   * @param playDirectionIsReverse true if {@link #getPreviousFrame()} will be called next instead of {@link #getNextFrame()}
    * @return Actual timecode we seeked to
    */
-  public long seek(final long timecode)
+  public synchronized long seek(long timecode, boolean playDirectionIsReverse)
   {
-    return 0;
+    parseCuesIfNeeded();
+    frameQueue.clear();
+    int cueIdx = binarySearchCuesByTime(0, cueList.size(), timecode);
+    FileCue cue = cueList.get(cueIdx);
+    if (playDirectionIsReverse && cue.timecode != timecode)
+    {
+      // When playing in reverse, we have to skip one additional cluster
+      // so that the play head actually crosses the seek time
+      cueIdx = Math.min(cueIdx + 1, cueList.size() - 1);
+    }
+    ioDS.seek(cue.position);
+    clusterReadIndex = cueIdx;
+    level1 = null;
+    return cue.timecode;
   }
 
-  private void fillFrameQueue()
+  private int binarySearchCuesByTime(int startIdx, int endIdx, long timecode)
+  {
+    if (startIdx == endIdx)
+    {
+      return startIdx;
+    }
+    int pos = (startIdx + endIdx) / 2;
+    FileCue cue = cueList.get(pos);
+    if (cue.timecode == timecode)
+    {
+      return pos;
+    }
+    if (cue.timecode > timecode)
+    {
+      if (pos == endIdx)
+      {
+        return startIdx;
+      }
+      return binarySearchCuesByTime(startIdx, pos, timecode);
+    }
+    if (pos == startIdx)
+    {
+      return startIdx;
+    }
+    return binarySearchCuesByTime(pos, endIdx, timecode);
+  }
+
+  private synchronized void fillFrameQueue()
   {
     if (level0 == null)
     {
       throw new java.lang.IllegalStateException("Call readFile() before reading frames");
     }
 
-    synchronized (level0)
+    if (level1 == null)
     {
-      Element level1 = ((MasterElement) level0).readNextChild(reader);
-      while (level1 != null)
-      {
-        if (level1.isType(MatroskaDocTypes.Cluster.getType()))
-        {
-          parseNextCluster(level1);
-        }
+      level1 = ((MasterElement) level0).readNextChild(reader);
+    }
 
-        level1.skipData(ioDS);
-        level1 = ((MasterElement) level0).readNextChild(reader);
+    while (frameQueue.isEmpty() && level1 != null)
+    {
+      if (level1.isType(MatroskaDocTypes.Cluster.getType()))
+      {
+        parseNextCluster(level1);
+        clusterReadIndex++;
       }
+
+      level1.skipData(ioDS);
+      level1 = ((MasterElement) level0).readNextChild(reader);
+    }
+  }
+
+  private void populateAc3Bitrates()
+  {
+    // Fast path: skip entirely when no AC3/EAC3 tracks are present
+    final Set<Integer> pendingAc3Tracks = new HashSet<>();
+    for (final MatroskaFileTrack track : trackList)
+    {
+      final String codecId = track.getCodecID();
+      if (("A_AC3".equals(codecId) || "A_EAC3".equals(codecId))
+          && track.getAudio() != null && track.getAudio().getBitrateKbps() == null)
+      {
+        pendingAc3Tracks.add(track.getTrackNo());
+      }
+    }
+    if (pendingAc3Tracks.isEmpty())
+    {
+      return;
+    }
+
+    // Scan the frame queue, reading additional clusters when needed until all
+    // AC3 tracks have a resolved bitrate or the cluster limit is reached.
+    final int MAX_EXTRA_CLUSTERS = 10;
+    int extraClusters = 0;
+    int frameOffset = 0;
+
+    while (!pendingAc3Tracks.isEmpty())
+    {
+      int frameIdx = 0;
+      for (final MatroskaFileFrame frame : frameQueue)
+      {
+        if (frameIdx++ < frameOffset)
+        {
+          continue; // skip frames already scanned in previous iterations
+        }
+        if (!pendingAc3Tracks.contains(frame.getTrackNo()))
+        {
+          continue;
+        }
+        final Integer kbps = MatroskaFileTrack.parseAc3BitrateKbps(frame.getData());
+        if (kbps != null)
+        {
+          getTrack(frame.getTrackNo()).getAudio().setBitrateKbps(kbps);
+          pendingAc3Tracks.remove(frame.getTrackNo());
+        }
+      }
+
+      if (pendingAc3Tracks.isEmpty() || extraClusters >= MAX_EXTRA_CLUSTERS)
+      {
+        break;
+      }
+
+      // Advance to the next cluster to obtain more frames
+      frameOffset = frameQueue.size();
+      if (level1 != null)
+      {
+        level1.skipData(ioDS);
+      }
+      level1 = ((MasterElement) level0).readNextChild(reader);
+      if (level1 == null || !level1.isType(MatroskaDocTypes.Cluster.getType()))
+      {
+        break;
+      }
+      parseNextCluster(level1);
+      extraClusters++;
     }
   }
 
@@ -362,10 +553,7 @@ public class MatroskaFile
         frame.setDuration(blockDuration);
         frame.setData(block.getFrame(0));
         frame.setKeyFrame(block.isKeyFrame());
-        synchronized (frameQueue)
-        {
-          frameQueue.add(new MatroskaFileFrame(frame));
-        }
+        frameQueue.add(new MatroskaFileFrame(frame));
 
         if (block.getFrameCount() > 1)
         {
@@ -546,29 +734,26 @@ public class MatroskaFile
               if (level4.isType(MatroskaDocTypes.TagTrackUID.getType()))
               {
                 level4.readData(ioDS);
-                tag.trackUID.add(new Long(((UnsignedIntegerElement) level4).getValue()));
-
+                tag.trackUID.add(((UnsignedIntegerElement) level4).getValue());
               }
               else if (level4.isType(MatroskaDocTypes.TagChapterUID.getType()))
               {
                 level4.readData(ioDS);
-                tag.chapterUID.add(new Long(((UnsignedIntegerElement) level4).getValue()));
-
+                tag.chapterUID.add(((UnsignedIntegerElement) level4).getValue());
               }
               else if (level4.isType(MatroskaDocTypes.TagAttachmentUID.getType()))
               {
                 level4.readData(ioDS);
-                tag.attachmentUID.add(new Long(((UnsignedIntegerElement) level4).getValue()));
+                tag.attachmentUID.add(((UnsignedIntegerElement) level4).getValue());
               }
 
               level4.skipData(ioDS);
               level4 = ((MasterElement) level3).readNextChild(reader);
             }
-
           }
           else if (level3.isType(MatroskaDocTypes.SimpleTag.getType()))
           {
-            tag.simpleTags.add(parseTagsSimpleTag(level3, level4));
+            tag.addSimpleTag(parseTagsSimpleTag(level3, level4));
           }
           level3.skipData(ioDS);
           level3 = ((MasterElement) level2).readNextChild(reader);
@@ -591,14 +776,14 @@ public class MatroskaFile
       if (level4.isType(MatroskaDocTypes.TagName.getType()))
       {
         level4.readData(ioDS);
-        simpleTag.name = ((StringElement) level4).getValue();
-
+        String tagName = ((StringElement) level4).getValue();
+        simpleTag.setName(tagName);
       }
       else if (level4.isType(MatroskaDocTypes.TagString.getType()))
       {
         level4.readData(ioDS);
-        simpleTag.value = ((StringElement) level4).getValue();
-
+        String tagString = ((StringElement) level4).getValue();
+        simpleTag.setValue(tagString);
       }
 
       level4.skipData(ioDS);
@@ -606,6 +791,68 @@ public class MatroskaFile
     }
 
     return simpleTag;
+  }
+
+  private static class FileCue
+  {
+    long position;
+    long trackId;
+    long timecode;
+
+    @Override
+    public String toString()
+    {
+      return new StringBuilder(128).append("Cue{position=")
+                                   .append(position)
+                                   .append(", trackId=")
+                                   .append(trackId)
+                                   .append(", timecode=")
+                                   .append(timecode)
+                                   .append('}')
+                                   .toString();
+    }
+  }
+
+  private void parseCues(MasterElement level1)
+  {
+    LOG.debug("Parsing cues");
+    for (Element level2 : level1.remainingChildren(ioDS, reader))
+    {
+      if (level2.isType(MatroskaDocTypes.CuePoint.getType()))
+      {
+        MasterElement cuePoint = (MasterElement) level2;
+        FileCue cue = new FileCue();
+        for (Element level3 : cuePoint.remainingChildren(ioDS, reader))
+        {
+          MatroskaDocType level3Type = MatroskaDocType.getType(level3);
+          if (level3Type == MatroskaDocType.CueTime)
+          {
+            level3.readData(ioDS);
+            cue.timecode = ((UnsignedIntegerElement) level3).getValue();
+          }
+          else if (level3Type == MatroskaDocType.CueTrackPositions)
+          {
+            MasterElement cueTrack = (MasterElement) level3;
+            for (Element level4 : cueTrack.remainingChildren(ioDS, reader))
+            {
+              level4.readData(ioDS);
+              MatroskaDocType level4Type = MatroskaDocType.getType(level4);
+              if (level4Type == MatroskaDocType.CueTrack)
+              {
+                cue.trackId = ((UnsignedIntegerElement) level4).getValue();
+              }
+              else if (level4Type == MatroskaDocType.CueClusterPosition)
+              {
+                // Compute absolution position by adding the offset of the end of the segment header
+                cue.position = ((UnsignedIntegerElement) level4).getValue() + endOfSegmentHeader;
+              }
+            }
+          }
+          LOG.debug("Found cue {}", cue);
+        }
+        cueList.add(cue);
+      }
+    }
   }
 
   /**
@@ -640,6 +887,12 @@ public class MatroskaFile
     {
       s.write("\tTag Entry \n");
       s.write(tagList.get(t).toString());
+    }
+
+    s.write("Cue Count: " + cueList.size() + "\n");
+    for (FileCue cue : cueList)
+    {
+      s.write("\t\t" + cue);
     }
 
     s.write("End report\n");
@@ -745,5 +998,10 @@ public class MatroskaFile
   public boolean getScanFirstCluster()
   {
     return scanFirstCluster;
+  }
+
+  public List<MatroskaFileTagEntry> getTagList()
+  {
+    return tagList;
   }
 }
